@@ -1,0 +1,133 @@
+import { pipeline, RawImage, env } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.3';
+env.allowLocalModels=false;
+const $=s=>document.querySelector(s), video=$('#video'), overlay=$('#overlay'), ctx=overlay.getContext('2d'), frame=$('#frameCanvas'), fctx=frame.getContext('2d');
+let detector=null,stream=null,running=false,busy=false,lastTick=0,alertCount=0,nextTrackId=1,tracks=[];
+let lastVideoTime=0,lastVideoWall=performance.now(),videoFpsEMA=0,detectMsEMA=0,faceMsEMA=0;
+let identities=JSON.parse(localStorage.getItem('vg-identities-v4')||'[]');
+let authorizedVehicles=JSON.parse(localStorage.getItem('vg-vehicles-v5')||'[]');
+let ocrWorker=null,ocrBusy=false,lastOcrAt=0;
+const wanted=new Set(['person','car','truck','bus','motorcycle','bicycle']), vehicleSet=new Set(['car','truck','bus','motorcycle','bicycle']);
+const MAX_MISSES=5, MAX_DISTANCE=.18;
+function status(t){$('#modelStatus').textContent=t}
+async function loadModel(){if(detector)return detector;status('Modelo: descargando…');detector=await pipeline('object-detection','Xenova/yolos-tiny',{dtype:'q8'});status('Modelo: YOLOS Tiny listo');return detector}
+function resize(){const r=video.getBoundingClientRect();overlay.width=Math.max(1,Math.round(r.width*devicePixelRatio));overlay.height=Math.max(1,Math.round(r.height*devicePixelRatio));ctx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0)}
+function resetTracking(){tracks=[];nextTrackId=1;$('#tracked').textContent='0'}
+async function startCamera(){stop();try{stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment',width:{ideal:1280},height:{ideal:720}},audio:false});video.srcObject=stream;video.removeAttribute('src');video.controls=false;await video.play();begin()}catch(e){addEvent('Cámara no disponible','Comprueba el permiso del navegador','high')}}
+function loadFile(file){stop();if(!file)return;video.srcObject=null;video.crossOrigin='anonymous';video.src=URL.createObjectURL(file);video.loop=true;video.controls=true;video.play().then(begin)}
+function loadUrl(){const u=prompt('URL HTTPS directa a un MP4/WebM autorizado:');if(!u)return;try{const x=new URL(u);if(x.protocol!=='https:')throw new Error();stop();video.srcObject=null;video.crossOrigin='anonymous';video.src=x.href;video.loop=true;video.controls=true;video.play().then(begin).catch(()=>addEvent('No se pudo reproducir la URL','El servidor puede bloquear CORS/hotlink. Descarga el clip y usa Cargar MP4.','medium'))}catch(e){addEvent('URL no válida','Usa una URL HTTPS directa al vídeo','medium')}}
+function begin(){resetTracking();running=true;$('#emptyState').hidden=true;resize();Promise.all([loadModel(),loadFaceModels()]).then(loop).catch(e=>{status('Error cargando modelo');addEvent('Error de IA',e.message,'high')})}
+function stop(){running=false;if(stream){stream.getTracks().forEach(t=>t.stop());stream=null}video.pause();video.srcObject=null;ctx.clearRect(0,0,overlay.width,overlay.height);$('#emptyState').hidden=false;resetTracking()}
+function zone(w,h){return{x:w*.3,y:h*.2,w:w*.4,h:h*.65}}
+function center(b){return{x:(b.xmin+b.xmax)/2,y:(b.ymin+b.ymax)/2}}
+function inZone(b,z){const c=center(b);return c.x>z.x&&c.x<z.x+z.w&&c.y>z.y&&c.y<z.y+z.h}
+function distance(a,b,w,h){const A=center(a),B=center(b);return Math.hypot((A.x-B.x)/w,(A.y-B.y)/h)}
+function severity(t){if(t.inside&&t.label==='person'){if(t.identity?.state==='UNKNOWN')return'high';if(t.identity?.state==='UNCERTAIN')return'medium';if(t.identity?.state==='KNOWN')return'low'}if(t.inside&&vehicleSet.has(t.label)){if(t.vehicleIdentity?.state==='AUTHORIZED')return'low';if(t.vehicleIdentity?.state==='UNKNOWN')return'high';return'medium'}return'low'}
+function addEvent(title,detail,sev='low'){if(sev!=='low'){alertCount++;$('#alerts').textContent=alertCount}const el=document.createElement('div');el.className='event '+sev;el.innerHTML=`<b>${title}</b><small>${new Date().toLocaleTimeString()} · ${detail}</small>`;const list=$('#eventList');if(list.querySelector('.hint'))list.innerHTML='';list.prepend(el);while(list.children.length>40)list.lastChild.remove()}
+function updateTracks(dets,w,h,z,now){const usable=dets.filter(d=>wanted.has(d.label));tracks.forEach(t=>{t.matched=false;t.misses++});
+ for(const d of usable){let best=null,bestDist=Infinity;for(const t of tracks){if(t.matched||t.label!==d.label)continue;const dist=distance(t.box,d.box,w,h);if(dist<MAX_DISTANCE&&dist<bestDist){best=t;bestDist=dist}}if(best){const oc=center(best.box),nc=center(d.box),dt=Math.max(1,now-best.lastSeen);best.vx=.7*(best.vx||0)+.3*((nc.x-oc.x)/dt);best.vy=.7*(best.vy||0)+.3*((nc.y-oc.y)/dt);best.box=d.box;best.score=d.score;best.lastSeen=now;best.misses=0;best.matched=true}else{tracks.push({id:nextTrackId++,label:d.label,box:d.box,score:d.score,firstSeen:now,lastSeen:now,misses:0,matched:true,inside:false,enteredAt:null,alerted:false,identity:{state:'UNCERTAIN',name:null,score:0},lastIdentityAt:0,identityVotes:[],vx:0,vy:0,vehicleIdentity:{state:'UNCERTAIN',plate:null},plateVotes:{}})}}
+ tracks=tracks.filter(t=>t.misses<=MAX_MISSES);
+ for(const t of tracks){if(!t.matched)continue;const inside=$('#restricted').checked&&inZone(t.box,z);if(inside&&!t.inside){t.inside=true;t.enteredAt=now;t.alerted=false;addEvent('Entrada en zona',`${name(t)} · detectado en zona restringida`,severity(t))}else if(!inside&&t.inside){const dwell=Math.max(0,(now-t.enteredAt)/1000);addEvent('Salida de zona',`${name(t)} · permanencia ${dwell.toFixed(1)} s`,'low');t.inside=false;t.enteredAt=null;t.alerted=false}if(t.inside&&t.enteredAt&&!t.alerted){const dwell=(now-t.enteredAt)/1000,limit=Number($('#dwell').value);if(dwell>=limit){const sev=severity(t);addEvent(sev==='high'?'Alerta de intrusión':'Permanencia en zona',`${name(t)} · ${dwell.toFixed(1)} s en zona`,sev);t.alerted=true}}}
+ $('#tracked').textContent=tracks.filter(t=>t.matched).length;
+}
+function name(t){return `${t.label==='person'?'Persona':vehicleSet.has(t.label)?'Vehículo':t.label} #${t.id}`}
+function draw(dets,srcW,srcH){resize();const cssW=overlay.clientWidth,cssH=overlay.clientHeight;ctx.clearRect(0,0,cssW,cssH);const scale=Math.min(cssW/srcW,cssH/srcH),ox=(cssW-srcW*scale)/2,oy=(cssH-srcH*scale)/2,z=zone(srcW,srcH),now=performance.now();updateTracks(dets,srcW,srcH,z,now);
+ if($('#restricted').checked){ctx.setLineDash([8,6]);ctx.strokeStyle='#f4b84a';ctx.lineWidth=2;ctx.strokeRect(ox+z.x*scale,oy+z.y*scale,z.w*scale,z.h*scale);ctx.setLineDash([]);ctx.font='12px system-ui';ctx.fillStyle='#f4b84a';ctx.fillText('ZONA RESTRINGIDA',ox+z.x*scale+6,oy+z.y*scale+16)}
+ let p=0,v=0;for(const t of tracks.filter(t=>t.matched)){if(t.label==='person')p++;if(vehicleSet.has(t.label))v++;const b=t.box,sev=severity(t),x=ox+b.xmin*scale,y=oy+b.ymin*scale,bw=(b.xmax-b.xmin)*scale,bh=(b.ymax-b.ymin)*scale,dwell=t.inside&&t.enteredAt?` · ${((now-t.enteredAt)/1000).toFixed(1)}s`:'';ctx.strokeStyle=sev==='high'?'#ff5e69':sev==='medium'?'#f4b84a':'#5bd49a';ctx.lineWidth=2;ctx.strokeRect(x,y,bw,bh);const identity=t.label==='person'?` · ${t.identity?.state||'UNCERTAIN'}${t.identity?.name?' '+t.identity.name:''}${Number.isFinite(t.identity?.distance)?' d='+t.identity.distance.toFixed(2):''}`:vehicleSet.has(t.label)?` · ${t.vehicleIdentity?.state||'UNCERTAIN'}${t.vehicleIdentity?.plate?' '+t.vehicleIdentity.plate:''}`:'';const text=`${name(t)} · ${Math.round(t.score*100)}%${identity}${dwell}`;ctx.font='12px system-ui';const tw=ctx.measureText(text).width+10;ctx.fillStyle=ctx.strokeStyle;ctx.fillRect(x,Math.max(0,y-20),tw,20);ctx.fillStyle='#07101c';ctx.fillText(text,x+5,Math.max(14,y-6))}$('#people').textContent=p;$('#vehicles').textContent=v;$('#authorizedVehicles').textContent=tracks.filter(t=>t.matched&&vehicleSet.has(t.label)&&t.vehicleIdentity?.state==='AUTHORIZED').length}
+async function loop(ts=performance.now()){if(!running)return;requestAnimationFrame(loop);if(video.readyState>=2&&video.currentTime!==lastVideoTime){const wall=performance.now(),dt=wall-lastVideoWall;if(dt>0){const inst=1000/dt;videoFpsEMA=videoFpsEMA?videoFpsEMA*.9+inst*.1:inst;$('#videoFps').textContent=videoFpsEMA.toFixed(1)}lastVideoWall=wall;lastVideoTime=video.currentTime}if(busy||video.readyState<2||ts-lastTick<450)return;busy=true;const totalStart=performance.now();try{const maxW=640,ratio=Math.min(1,maxW/video.videoWidth);frame.width=Math.max(1,Math.round(video.videoWidth*ratio));frame.height=Math.max(1,Math.round(video.videoHeight*ratio));fctx.drawImage(video,0,0,frame.width,frame.height);const image=RawImage.fromCanvas(frame),threshold=Number($('#threshold').value)/100,d0=performance.now(),out=await detector(image,{threshold,percentage:false});const dm=performance.now()-d0;detectMsEMA=detectMsEMA?detectMsEMA*.8+dm*.2:dm;$('#detectMs').textContent=Math.round(detectMsEMA);draw(out,frame.width,frame.height);detectFacesAndIdentify(ts);scanVehiclePlate(ts);const total=performance.now()-totalStart;$('#latency').textContent=Math.round(total);$('#fps').textContent=(1000/Math.max(1,total)).toFixed(1)}catch(e){console.error(e)}finally{lastTick=performance.now();busy=false}}
+let faceModelsReady=false, faceBusy=false;
+const FACE_MODEL_URL='https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/';
+async function loadFaceModels(){
+ if(faceModelsReady)return true;
+ status(detector?'Objetos listos · cargando caras…':'Cargando modelos…');
+ try{
+  await Promise.all([faceapi.nets.tinyFaceDetector.loadFromUri(FACE_MODEL_URL),faceapi.nets.faceLandmark68TinyNet.loadFromUri(FACE_MODEL_URL),faceapi.nets.faceRecognitionNet.loadFromUri(FACE_MODEL_URL)]);
+  faceModelsReady=true; status('YOLOS + FaceAPI listos'); return true;
+ }catch(e){console.error(e);status('Objetos listos · caras no disponibles');return false}
+}
+function euclidean(a,b){if(!a||!b||a.length!==b.length)return Infinity;let s=0;for(let i=0;i<a.length;i++){const d=a[i]-b[i];s+=d*d}return Math.sqrt(s)}
+function faceInsidePerson(faceBox,personBox){const cx=faceBox.x+faceBox.width/2,cy=faceBox.y+faceBox.height/2;return cx>=personBox.xmin&&cx<=personBox.xmax&&cy>=personBox.ymin&&cy<=personBox.ymax}
+async function detectFacesAndIdentify(now){
+ if(faceBusy||!faceModelsReady)return;faceBusy=true;const t0=performance.now();
+ try{
+  const faces=await faceapi.detectAllFaces(frame,new faceapi.TinyFaceDetectorOptions({inputSize:224,scoreThreshold:.5})).withFaceLandmarks(true).withFaceDescriptors();
+  for(const t of tracks.filter(t=>t.matched&&t.label==='person')){
+   if(now-t.lastIdentityAt<1000)continue;t.lastIdentityAt=now;
+   const candidates=faces.filter(f=>faceInsidePerson(f.detection.box,t.box));
+   if(candidates.length!==1)continue;
+   const f=candidates[0], fb=f.detection.box; const area=fb.width*fb.height;
+   if(f.detection.score<.55||fb.width<34||fb.height<34||area<1400)continue; // quality gate
+   const descriptor=Array.from(f.descriptor); let state='UNKNOWN',personName=null,bestDistance=Infinity;
+   if(identities.length){let best=null;for(const id of identities)for(const sample of (id.descriptors||[])){const d=euclidean(descriptor,sample);if(d<bestDistance){bestDistance=d;best=id}}const max=Number($('#identityThreshold').value)/100;if(bestDistance<=max){state='KNOWN';personName=best.name}else if(bestDistance<=max+.08)state='UNCERTAIN'}
+   t.identityVotes=t.identityVotes||[];t.identityVotes.push({state,name:personName,distance:bestDistance,at:now});t.identityVotes=t.identityVotes.filter(v=>now-v.at<7000).slice(-7);
+   const known=t.identityVotes.filter(v=>v.state==='KNOWN');const unknown=t.identityVotes.filter(v=>v.state==='UNKNOWN');const uncertain=t.identityVotes.filter(v=>v.state==='UNCERTAIN');
+   if(known.length>=3){const names={};known.forEach(v=>names[v.name]=(names[v.name]||0)+1);const winner=Object.entries(names).sort((a,b)=>b[1]-a[1])[0];if(winner&&winner[1]>=3){const ds=known.filter(v=>v.name===winner[0]).map(v=>v.distance);t.identity={state:'KNOWN',name:winner[0],distance:ds.reduce((a,b)=>a+b,0)/ds.length}}}
+   else if(unknown.length>=3)t.identity={state:'UNKNOWN',name:null,distance:Math.min(...unknown.map(v=>v.distance))};
+   else t.identity={state:'UNCERTAIN',name:null,distance:uncertain.length?Math.min(...uncertain.map(v=>v.distance)):null};
+  }
+  $('#known').textContent=tracks.filter(t=>t.matched&&t.identity?.state==='KNOWN').length;$('#idSamples').textContent=tracks.reduce((n,t)=>n+(t.identityVotes?.length||0),0);
+ }catch(e){console.error('Face inference',e)}finally{const ms=performance.now()-t0;faceMsEMA=faceMsEMA?faceMsEMA*.8+ms*.2:ms;$('#faceMs').textContent=Math.round(faceMsEMA);faceBusy=false}
+}
+async function captureEnrollmentSamples(count=5){
+ if(!await loadFaceModels())throw new Error('No se pudieron cargar los modelos faciales');
+ const samples=[];
+ for(let i=0;i<count;i++){
+  fctx.drawImage(video,0,0,frame.width,frame.height);
+  const faces=await faceapi.detectAllFaces(frame,new faceapi.TinyFaceDetectorOptions({inputSize:320,scoreThreshold:.55})).withFaceLandmarks(true).withFaceDescriptors();
+  if(faces.length===1)samples.push(Array.from(faces[0].descriptor));
+  await new Promise(r=>setTimeout(r,220));
+ }
+ return samples;
+}
+async function enroll(){
+ if(video.readyState<2){addEvent('Registro no disponible','Inicia la cámara o un vídeo antes de registrar','medium');return}
+ const name=prompt('Nombre o alias de la persona autorizada:');if(!name)return;
+ const btn=$('#enrollBtn');btn.disabled=true;btn.textContent='Capturando 5 muestras…';
+ try{
+  const descriptors=await captureEnrollmentSamples(5);
+  if(descriptors.length<3){addEvent('Alta incompleta',`Solo ${descriptors.length}/5 muestras válidas. Deja una sola cara visible y mira a cámara.`,'medium');return}
+  const clean=name.trim().slice(0,40);identities.push({id:crypto.randomUUID(),name:clean,descriptors,created:Date.now(),version:2});saveIdentities();
+  addEvent('Persona autorizada registrada',`${clean} · ${descriptors.length} muestras faciales guardadas localmente`,'low');
+ }catch(e){addEvent('Error de registro',e.message,'high')}finally{btn.disabled=false;btn.textContent='+ Registrar persona'}
+}
+function saveIdentities(){localStorage.setItem('vg-identities-v4',JSON.stringify(identities));renderIdentities()}
+function renderIdentities(){const el=$('#identityList');if(!identities.length){el.innerHTML='<p class="hint">No hay perfiles registrados.</p>';return}el.innerHTML=identities.map(i=>`<div class="identity-row"><div class="identity-meta"><b>${i.name}</b><small>${(i.descriptors||[]).length} muestras · local · ${new Date(i.created).toLocaleDateString()}</small></div><button class="danger" data-delete="${i.id}">Eliminar</button></div>`).join('');el.querySelectorAll('[data-delete]').forEach(b=>b.onclick=()=>{identities=identities.filter(i=>i.id!==b.dataset.delete);saveIdentities()})}
+renderIdentities();
+$('#enrollBtn').onclick=enroll;$('#identityThreshold').oninput=e=>$('#identityText').textContent=(Number(e.target.value)/100).toFixed(2);
+$('#cameraBtn').onclick=startCamera;$('#urlBtn').onclick=loadUrl;$('#stopBtn').onclick=stop;$('#fileInput').onchange=e=>loadFile(e.target.files[0]);$('#threshold').oninput=e=>$('#thresholdText').textContent=e.target.value+'%';$('#dwell').oninput=e=>$('#dwellText').textContent=e.target.value+' s';$('#clearBtn').onclick=()=>{$('#eventList').innerHTML='<p class="hint">Los eventos aparecerán aquí.</p>';alertCount=0;$('#alerts').textContent='0'};window.addEventListener('resize',resize);
+
+function normalizePlate(text){return (text||'').toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,10)}
+function plausiblePlate(p){return p.length>=5&&p.length<=9&&/[A-Z]/.test(p)&&/\d/.test(p)}
+async function ensureOcr(){if(ocrWorker)return ocrWorker;if(!window.Tesseract)throw new Error('Tesseract.js no disponible');ocrWorker=await Tesseract.createWorker('eng',1,{logger:m=>{if(m.status==='recognizing text')status(`OCR ${Math.round((m.progress||0)*100)}%`)}});try{await ocrWorker.setParameters({tessedit_char_whitelist:'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',tessedit_pageseg_mode:'7'})}catch(e){}status('YOLOS + FaceAPI + OCR listos');return ocrWorker}
+function plateCropFor(t){const b=t.box,w=b.xmax-b.xmin,h=b.ymax-b.ymin;return{x:Math.max(0,b.xmin+w*.18),y:Math.max(0,b.ymin+h*.55),w:Math.max(1,w*.64),h:Math.max(1,h*.28)}}
+async function scanVehiclePlate(now){if(ocrBusy||now-lastOcrAt<1800)return;const candidates=tracks.filter(t=>t.matched&&vehicleSet.has(t.label)&&t.score>.55);if(!candidates.length)return;const t=candidates.sort((a,b)=>((b.box.xmax-b.box.xmin)*(b.box.ymax-b.box.ymin))-((a.box.xmax-a.box.xmin)*(a.box.ymax-a.box.ymin)))[0];const c=plateCropFor(t);if(c.w<70||c.h<18)return;ocrBusy=true;lastOcrAt=now;try{const worker=await ensureOcr();const crop=document.createElement('canvas');crop.width=Math.round(c.w*2);crop.height=Math.round(c.h*2);const cc=crop.getContext('2d');cc.filter='grayscale(1) contrast(1.8)';cc.drawImage(frame,c.x,c.y,c.w,c.h,0,0,crop.width,crop.height);const ret=await worker.recognize(crop);const plate=normalizePlate(ret.data.text);if(!plausiblePlate(plate)){t.vehicleIdentity={state:'UNCERTAIN',plate:null};return}t.plateVotes[plate]=(t.plateVotes[plate]||0)+1;const [best,count]=Object.entries(t.plateVotes).sort((a,b)=>b[1]-a[1])[0];if(count>=2){const auth=authorizedVehicles.find(v=>normalizePlate(v.plate)===best);const previous=t.vehicleIdentity?.plate;t.vehicleIdentity={state:auth?'AUTHORIZED':'UNKNOWN',plate:best,name:auth?.name||null};if(previous!==best)addEvent(auth?'Vehículo autorizado identificado':'Matrícula no autorizada',`${name(t)} · ${best}${auth?.name?' · '+auth.name:''}`,auth?'low':'medium')}}catch(e){console.error('OCR',e)}finally{ocrBusy=false;if(faceModelsReady)status('YOLOS + FaceAPI + OCR listos')}}
+function saveVehicles(){localStorage.setItem('vg-vehicles-v5',JSON.stringify(authorizedVehicles));renderVehicles()}
+function renderVehicles(){const el=$('#vehicleList');if(!el)return;if(!authorizedVehicles.length){el.innerHTML='<p class="hint">No hay vehículos registrados.</p>';return}el.innerHTML=authorizedVehicles.map(v=>`<div class="vehicle-row"><div class="vehicle-meta"><b class="plate">${v.plate}</b><small>${v.name||'Vehículo autorizado'} · local</small></div><button class="danger" data-vdelete="${v.id}">Eliminar</button></div>`).join('');el.querySelectorAll('[data-vdelete]').forEach(b=>b.onclick=()=>{authorizedVehicles=authorizedVehicles.filter(v=>v.id!==b.dataset.vdelete);saveVehicles()})}
+function addVehicle(){const raw=prompt('Matrícula autorizada (ej. 1234ABC):');if(!raw)return;const plate=normalizePlate(raw);if(!plausiblePlate(plate)){addEvent('Matrícula no válida','Introduce entre 5 y 9 caracteres alfanuméricos','medium');return}const name=(prompt('Alias del vehículo (opcional):')||'').trim().slice(0,40);if(authorizedVehicles.some(v=>v.plate===plate)){addEvent('Vehículo ya registrado',plate,'medium');return}authorizedVehicles.push({id:crypto.randomUUID(),plate,name,created:Date.now()});saveVehicles();addEvent('Vehículo autorizado registrado',`${plate}${name?' · '+name:''}`,'low')}
+renderVehicles();
+$('#vehicleBtn').onclick=addVehicle;
+
+// ---- v6: configurable rule engine + incident workflow ----
+const DEFAULT_RULES=[
+ {id:'r-unknown-person',name:'Intrusión persona desconocida',object:'person',identity:'UNKNOWN',inside:true,dwell:5,severity:'high',enabled:true},
+ {id:'r-uncertain-person',name:'Persona sin identificar',object:'person',identity:'UNCERTAIN',inside:true,dwell:8,severity:'medium',enabled:true},
+ {id:'r-known-person',name:'Autorizado en zona',object:'person',identity:'KNOWN',inside:true,dwell:10,severity:'low',enabled:true},
+ {id:'r-unknown-vehicle',name:'Vehículo no autorizado',object:'vehicle',identity:'UNKNOWN',inside:true,dwell:4,severity:'high',enabled:true},
+ {id:'r-auth-vehicle',name:'Vehículo autorizado',object:'vehicle',identity:'AUTHORIZED',inside:true,dwell:2,severity:'low',enabled:true}
+];
+let rules=JSON.parse(localStorage.getItem('vg-rules-v6')||'null')||structuredClone(DEFAULT_RULES);
+let incidents=JSON.parse(localStorage.getItem('vg-incidents-v6')||'[]');
+function saveRules(){localStorage.setItem('vg-rules-v6',JSON.stringify(rules));renderRules()}
+function saveIncidents(){localStorage.setItem('vg-incidents-v6',JSON.stringify(incidents.slice(0,100)));renderIncidents()}
+function trackObject(t){return t.label==='person'?'person':vehicleSet.has(t.label)?'vehicle':t.label}
+function trackIdentity(t){return t.label==='person'?(t.identity?.state||'UNCERTAIN'):(vehicleSet.has(t.label)?(t.vehicleIdentity?.state||'UNCERTAIN'):'ANY')}
+function ruleMatches(r,t,now){if(!r.enabled||!t.matched)return false;if(r.object!=='any'&&r.object!==trackObject(t))return false;if(r.identity!=='ANY'&&r.identity!==trackIdentity(t))return false;if(r.inside&&!t.inside)return false;const dwell=t.inside&&t.enteredAt?(now-t.enteredAt)/1000:0;return dwell>=Number(r.dwell||0)}
+function createIncident(rule,t,now){t.ruleFired=t.ruleFired||{};if(t.ruleFired[rule.id])return;t.ruleFired[rule.id]=true;const inc={id:crypto.randomUUID(),ruleId:rule.id,ruleName:rule.name,severity:rule.severity,trackId:t.id,object:trackObject(t),identity:trackIdentity(t),label:name(t),created:Date.now(),status:'open',detail:`${name(t)} · ${trackIdentity(t)} · ${t.inside&&t.enteredAt?((now-t.enteredAt)/1000).toFixed(1):0}s`};incidents.unshift(inc);saveIncidents();addEvent(`Regla: ${rule.name}`,inc.detail,rule.severity)}
+function evaluateRules(now){for(const t of tracks)for(const r of rules)if(ruleMatches(r,t,now))createIncident(r,t,now)}
+const _updateTracksV5=updateTracks;
+updateTracks=function(dets,w,h,z,now){_updateTracksV5(dets,w,h,z,now);for(const t of tracks){t.ruleFired=t.ruleFired||{};if(!t.inside)t.ruleFired={}}evaluateRules(now)};
+function renderRules(){const el=$('#ruleList');if(!el)return;el.innerHTML=rules.map(r=>`<div class="rule-card ${r.enabled?'':'disabled'}"><div><b>${r.name}</b><small>${r.object} · ${r.identity} · zona restringida · ≥ ${r.dwell}s · ${r.severity.toUpperCase()}</small></div><div class="rule-actions"><button data-toggle-rule="${r.id}">${r.enabled?'ON':'OFF'}</button><button class="danger" data-delete-rule="${r.id}">Eliminar</button></div></div>`).join('')||'<p class="hint">No hay reglas.</p>';el.querySelectorAll('[data-toggle-rule]').forEach(b=>b.onclick=()=>{const r=rules.find(x=>x.id===b.dataset.toggleRule);r.enabled=!r.enabled;saveRules()});el.querySelectorAll('[data-delete-rule]').forEach(b=>b.onclick=()=>{rules=rules.filter(x=>x.id!==b.dataset.deleteRule);saveRules()})}
+function renderIncidents(){const el=$('#incidentList');if(!el)return;if(!incidents.length){el.innerHTML='<p class="hint">No hay incidentes.</p>';return}el.innerHTML=incidents.map(i=>`<div class="incident ${i.severity} ${i.status==='resolved'?'resolved':''}"><div><b>${i.ruleName}</b> <span class="badge">${i.status.toUpperCase()}</span><small>${new Date(i.created).toLocaleTimeString()} · ${i.detail}</small></div><div class="incident-actions">${i.status==='open'?`<button data-ack="${i.id}">Reconocer</button>`:''}${i.status!=='resolved'?`<button data-resolve="${i.id}">Resolver</button>`:''}</div></div>`).join('');el.querySelectorAll('[data-ack]').forEach(b=>b.onclick=()=>{const i=incidents.find(x=>x.id===b.dataset.ack);if(i){i.status='acknowledged';saveIncidents()}});el.querySelectorAll('[data-resolve]').forEach(b=>b.onclick=()=>{const i=incidents.find(x=>x.id===b.dataset.resolve);if(i){i.status='resolved';saveIncidents()}})}
+$('#addRuleBtn').onclick=()=>{const nm=$('#ruleName').value.trim()||'Regla personalizada';rules.push({id:crypto.randomUUID(),name:nm.slice(0,50),object:$('#ruleObject').value,identity:$('#ruleIdentity').value,inside:true,dwell:Math.max(0,Number($('#ruleDwell').value)||0),severity:$('#ruleSeverity').value,enabled:true});$('#ruleName').value='';saveRules()};
+$('#resetRulesBtn').onclick=()=>{rules=structuredClone(DEFAULT_RULES);saveRules()};
+$('#clearIncidentsBtn').onclick=()=>{incidents=incidents.filter(i=>i.status!=='resolved');saveIncidents()};
+renderRules();renderIncidents();
